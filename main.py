@@ -62,6 +62,7 @@ class CleanerOptions:
 # Helpers
 # ----------------------------
 
+
 def normalize_header(h: str) -> str:
     if h is None:
         return ""
@@ -225,22 +226,45 @@ def combine_errors(*errs: Optional[str]) -> Optional[str]:
 # Critical: Fix Excel "CSV in one column" sheets
 # ----------------------------
 
+
 def maybe_expand_csv_in_one_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     If Excel sheet has a single column where each cell is a CSV line,
     expand it into proper columns using csv.reader.
     Handles ragged rows by trimming/padding to header length.
+
+    This is more robust than checking only the column name: some sheets
+    put the entire CSV (header + rows) into the *first cell* or the column header.
     """
     if df.shape[1] != 1:
         return df
 
+    # Get the header (column name) and the first few cell values.
     only_col_name = str(df.columns[0])
-    if "," not in only_col_name:
-        return df
+    values = df.iloc[:, 0].astype(str).tolist()
 
-    # Build CSV text: header line + each row as a line
-    lines = [only_col_name]
-    for v in df.iloc[:, 0].tolist():
+    header_line = None
+    if "," in only_col_name:
+        header_line = only_col_name
+        data_values = values  # when header is in the column name, include all rows
+    else:
+        # look for a row that looks like a CSV header (has commas and likely non-numeric fields)
+        start_row = None
+        for i, v in enumerate(values):
+            if v is None:
+                continue
+            s = str(v).strip()
+            if "," in s:
+                start_row = i
+                header_line = s
+                break
+        if start_row is None:
+            return df
+        data_values = values[start_row + 1 :]
+
+    # Build CSV text: header line + each data row as a line
+    lines = [header_line]
+    for v in data_values:
         if v is None or (isinstance(v, float) and np.isnan(v)):
             continue
         lines.append(str(v))
@@ -276,14 +300,24 @@ def maybe_expand_csv_in_one_column(df: pd.DataFrame) -> pd.DataFrame:
 # Loaders
 # ----------------------------
 
+
 def load_from_excel(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    except ModuleNotFoundError:
+        raise SystemExit("Missing required package 'openpyxl'. Install it with: pip install openpyxl")
+    return maybe_expand_csv_in_one_column(df)
+
+
+def load_from_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype=str)
     return maybe_expand_csv_in_one_column(df)
 
 
 # ----------------------------
 # Dedupe
 # ----------------------------
+
 
 def apply_dedupe(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     d = df.copy()
@@ -306,6 +340,7 @@ def apply_dedupe(df: pd.DataFrame, mode: str) -> pd.DataFrame:
 # ----------------------------
 # Cleaner
 # ----------------------------
+
 
 def clean_contacts_df(df_raw: pd.DataFrame, opts: CleanerOptions) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = df_raw.copy()
@@ -412,6 +447,7 @@ def clean_contacts_df(df_raw: pd.DataFrame, opts: CleanerOptions) -> Tuple[pd.Da
 # Export (handles locked files)
 # ----------------------------
 
+
 def safe_remove(path: str) -> None:
     try:
         if os.path.exists(path):
@@ -431,11 +467,14 @@ def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: st
     safe_remove(errors_csv)
 
     cleaned_df.to_csv(cleaned_csv, index=False)
-    cleaned_df.to_excel(cleaned_xlsx, index=False)
+    try:
+        cleaned_df.to_excel(cleaned_xlsx, index=False)
+        print(f"[OK] Wrote: {cleaned_xlsx}")
+    except ModuleNotFoundError:
+        print("[WARN] Skipped writing .xlsx because 'openpyxl' is not installed. Install it with: pip install openpyxl")
     errors_df.to_csv(errors_csv, index=False)
 
     print(f"[OK] Wrote: {cleaned_csv}")
-    print(f"[OK] Wrote: {cleaned_xlsx}")
     print(f"[OK] Wrote: {errors_csv}")
 
 
@@ -443,9 +482,10 @@ def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: st
 # CLI
 # ----------------------------
 
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python data_cleaner.py excel --path file.xlsx --sheet Sheet1 --out cleaned")
+        print("Usage: python data_cleaner.py excel|csv --path file.xlsx --sheet Sheet1 --out cleaned")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
@@ -463,15 +503,22 @@ def main():
     opts.dedupe_mode = get_arg("--dedupe", opts.dedupe_mode) or opts.dedupe_mode
     opts.keep_original_columns = (get_arg("--keep_original", "false") or "false").lower() == "true"
 
-    if mode != "excel":
-        raise SystemExit("This updated version focuses on fixing your Excel input. Use mode: excel")
+    if mode not in ("excel", "csv"):
+        raise SystemExit("Mode must be 'excel' or 'csv'.")
 
     path = get_arg("--path")
     sheet = get_arg("--sheet")
     if not path:
-        raise SystemExit("excel mode requires --path <file.xlsx>")
+        raise SystemExit(f"{mode} mode requires --path <file>")
 
-    df_raw = load_from_excel(path, sheet_name=sheet)
+    # Read file
+    try:
+        if mode == "excel":
+            df_raw = load_from_excel(path, sheet_name=sheet)
+        else:
+            df_raw = load_from_csv(path)
+    except Exception as exc:
+        raise SystemExit(f"Failed reading input: {exc}")
 
     # Quick visibility for debugging
     print("[INFO] Loaded shape:", df_raw.shape)
