@@ -692,7 +692,11 @@ def clean_contacts_df(
 
     if opts.keep_original_columns:
         other_cols = [c for c in cleaned.columns if c not in base_cols and c != "__row_id"]
-        out_cols = base_cols + other_cols
+        # Add multiple blank separator columns for spacing
+        cleaned[""] = ""
+        cleaned[" "] = ""
+        cleaned["  "] = ""
+        out_cols = base_cols + ["", " ", "  "] + other_cols
     else:
         out_cols = base_cols
 
@@ -732,19 +736,36 @@ def safe_remove(path: str) -> None:
         raise PermissionError(f"File is locked (likely open in Excel): {path}. Close it and re-run.")
 
 
+def export_to_card_format(df: pd.DataFrame, output_txt: str) -> None:
+    """Export dataframe to card/form layout with each record shown vertically."""
+    with open(output_txt, 'w', encoding='utf-8') as f:
+        for idx, row in df.iterrows():
+            f.write(f"{'=' * 80}\n")
+            f.write(f"Record {idx + 1}\n")
+            f.write(f"{'=' * 80}\n\n")
+            
+            for col in df.columns:
+                value = row[col]
+                # Skip empty values for cleaner output
+                if pd.notna(value) and str(value).strip():
+                    f.write(f"{col:30s}: {value}\n")
+            
+            f.write("\n")
+
+
 def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: str) -> None:
-    cleaned_csv = f"{prefix}.csv"
+    cleaned_txt = f"{prefix}.txt"
     cleaned_xlsx = f"{prefix}.xlsx"
     errors_csv = f"{prefix}_errors.csv"
     missing_report_csv = f"{prefix}_missing_report.csv"
 
     # Remove old outputs first (avoids weird partial overwrites)
-    safe_remove(cleaned_csv)
+    safe_remove(cleaned_txt)
     safe_remove(cleaned_xlsx)
     safe_remove(errors_csv)
     safe_remove(missing_report_csv)
 
-    cleaned_df.to_csv(cleaned_csv, index=False)
+    export_to_card_format(cleaned_df, cleaned_txt)
     try:
         cleaned_df.to_excel(cleaned_xlsx, index=False)
         print(f"[OK] Wrote: {cleaned_xlsx}")
@@ -772,7 +793,7 @@ def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: st
         report_df.to_csv(missing_report_csv, index=False)
         print(f"[OK] Wrote: {missing_report_csv}")
 
-    print(f"[OK] Wrote: {cleaned_csv}")
+    print(f"[OK] Wrote: {cleaned_txt}")
     print(f"[OK] Wrote: {errors_csv}")
 
 
@@ -813,10 +834,23 @@ def export_outputs_streaming(
     prefix: str,
     is_first_chunk: bool,
 ) -> None:
-    cleaned_csv = f"{prefix}.csv"
+    cleaned_txt = f"{prefix}.txt"
     errors_csv = f"{prefix}_errors.csv"
 
-    cleaned_df.to_csv(cleaned_csv, index=False, mode="w" if is_first_chunk else "a", header=is_first_chunk)
+    # Append to card format file
+    with open(cleaned_txt, 'a' if not is_first_chunk else 'w', encoding='utf-8') as f:
+        for idx, row in cleaned_df.iterrows():
+            f.write(f"{'=' * 80}\n")
+            f.write(f"Record {idx + 1}\n")
+            f.write(f"{'=' * 80}\n\n")
+            
+            for col in cleaned_df.columns:
+                value = row[col]
+                if pd.notna(value) and str(value).strip():
+                    f.write(f"{col:30s}: {value}\n")
+            
+            f.write("\n")
+    
     errors_df.to_csv(errors_csv, index=False, mode="w" if is_first_chunk else "a", header=is_first_chunk)
 
 
@@ -896,9 +930,9 @@ def main():
     if opts.write_xlsx:
         print("[WARN] Skipping .xlsx output in chunked mode. Use full mode if you need .xlsx.")
 
-    cleaned_csv = f"{opts.output_prefix}.csv"
+    cleaned_txt = f"{opts.output_prefix}.txt"
     errors_csv = f"{opts.output_prefix}_errors.csv"
-    safe_remove(cleaned_csv)
+    safe_remove(cleaned_txt)
     safe_remove(errors_csv)
 
     seen_keys: Optional[set] = set() if opts.dedupe_mode != "none" else None
@@ -1011,7 +1045,7 @@ def main():
         ]
         mapping_df.to_csv(errors_csv, index=False, mode="a", header=False)
 
-    print(f"[OK] Wrote: {cleaned_csv}")
+    print(f"[OK] Wrote: {cleaned_txt}")
     print(f"[OK] Wrote: {errors_csv}")
 
     # Final summary for streaming (chunked) mode
