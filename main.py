@@ -11,9 +11,70 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import signal
+from collections import Counter
+
+
+_STREAMING_SUMMARY_STATE: Optional[dict] = None
+
+
+def _init_streaming_summary(prefix: str) -> None:
+    global _STREAMING_SUMMARY_STATE
+    _STREAMING_SUMMARY_STATE = {
+        "prefix": prefix,
+        "total_in": 0,
+        "total_out": 0,
+        "invalid_email": 0,
+        "invalid_phone": 0,
+        "missing_required": 0,
+        "error_types": Counter(),
+    }
+
+
+def _update_streaming_summary(
+    total_in: int = 0,
+    total_out: int = 0,
+    invalid_email: int = 0,
+    invalid_phone: int = 0,
+    missing_required: int = 0,
+    error_types: Optional[Counter] = None,
+) -> None:
+    global _STREAMING_SUMMARY_STATE
+    if _STREAMING_SUMMARY_STATE is None:
+        return
+    _STREAMING_SUMMARY_STATE["total_in"] += int(total_in)
+    _STREAMING_SUMMARY_STATE["total_out"] += int(total_out)
+    _STREAMING_SUMMARY_STATE["invalid_email"] += int(invalid_email)
+    _STREAMING_SUMMARY_STATE["invalid_phone"] += int(invalid_phone)
+    _STREAMING_SUMMARY_STATE["missing_required"] += int(missing_required)
+    if error_types:
+        _STREAMING_SUMMARY_STATE["error_types"].update(error_types)
+
+
+def _flush_streaming_summary(partial: bool = False) -> None:
+    global _STREAMING_SUMMARY_STATE
+    if _STREAMING_SUMMARY_STATE is None:
+        return
+    s = _STREAMING_SUMMARY_STATE
+    if partial:
+        print("[WARN] Writing partial summary before exit.")
+    _write_summary(
+        s["prefix"],
+        s["total_in"],
+        s["total_out"],
+        s["invalid_email"],
+        s["invalid_phone"],
+        s["missing_required"],
+        s["error_types"],
+    )
+    _STREAMING_SUMMARY_STATE = None
 
 
 def _signal_exit(signum, frame):
+    # Attempt to persist partial summary if we're in a streaming run.
+    try:
+        _flush_streaming_summary(partial=True)
+    except Exception:
+        pass
     print("\n[WARN] Interrupted by user (signal). Exiting.")
     sys.exit(130)
 
@@ -236,7 +297,8 @@ def parse_date_to_iso(x) -> Tuple[Optional[str], Optional[str]]:
     x = strip_or_nan(x)
     if pd.isna(x):
         return None, None
-    dt = pd.to_datetime(x, errors="coerce", infer_datetime_format=True)
+    # Some pandas versions don't accept `infer_datetime_format`; keep it simple and robust.
+    dt = pd.to_datetime(x, errors="coerce")
     if pd.isna(dt):
         return str(x), "invalid_date"
     return dt.date().isoformat(), None
@@ -402,10 +464,45 @@ def load_from_excel(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame
 
 
 def load_from_csv(path: str, chunksize: Optional[int] = None):
+    def robust_csv_reader(path, chunksize=None):
+        with open(path, newline='', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if not rows:
+            return pd.DataFrame()
+        header = rows[0]
+        n = len(header)
+        def fix_row(r):
+            if len(r) == n:
+                return r
+            elif len(r) > n:
+                return r[:n-1] + [','.join(r[n-1:])]
+            else:
+                return r + [''] * (n - len(r))
+        fixed_rows = [fix_row(r) for r in rows[1:]]
+        df = pd.DataFrame(fixed_rows, columns=header)
+        return df
+
     if chunksize:
-        return pd.read_csv(path, dtype=str, chunksize=chunksize)
-    df = pd.read_csv(path, dtype=str)
-    return maybe_expand_csv_in_one_column(df)
+        # For chunked mode, read all, fix, then yield in chunks
+        df = robust_csv_reader(path)
+        for i in range(0, len(df), chunksize):
+            yield df.iloc[i:i+chunksize].reset_index(drop=True)
+    else:
+        df = robust_csv_reader(path)
+        return maybe_expand_csv_in_one_column(df)
+
+
+def count_csv_rows(path: str) -> int:
+    """Fast line-count for CSV files. Returns number of data rows (excluding header) or 0 on error."""
+    try:
+        # Open in text mode with errors ignored (robust to minor encoding issues)
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            # Count lines; subtract 1 for header if present
+            n = sum(1 for _ in f)
+        return max(0, n - 1)
+    except Exception:
+        return 0
 
 
 # ----------------------------
@@ -482,6 +579,7 @@ def clean_contacts_df(
     df["__row_id"] = np.arange(len(df))
 
     # Ensure canonical columns exist
+    # Always ensure these canonical columns exist, even if not present in input
     for col in ["name_first", "name_last", "email", "phone", "addr_street", "addr_city", "addr_state", "addr_zip",
                 "signup_date", "status", "notes"]:
         if col not in df.columns:
@@ -638,11 +736,13 @@ def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: st
     cleaned_csv = f"{prefix}.csv"
     cleaned_xlsx = f"{prefix}.xlsx"
     errors_csv = f"{prefix}_errors.csv"
+    missing_report_csv = f"{prefix}_missing_report.csv"
 
     # Remove old outputs first (avoids weird partial overwrites)
     safe_remove(cleaned_csv)
     safe_remove(cleaned_xlsx)
     safe_remove(errors_csv)
+    safe_remove(missing_report_csv)
 
     cleaned_df.to_csv(cleaned_csv, index=False)
     try:
@@ -652,8 +752,59 @@ def export_outputs(cleaned_df: pd.DataFrame, errors_df: pd.DataFrame, prefix: st
         print("[WARN] Skipped writing .xlsx because 'openpyxl' is not installed. Install it with: pip install openpyxl")
     errors_df.to_csv(errors_csv, index=False)
 
+    # Write detailed missing/invalid report
+    if not errors_df.empty:
+        # Choose identifying columns (name, email, phone, row_id if present)
+        id_cols = [c for c in ["name_first", "name_last", "full_name", "email", "phone", "__row_id"] if c in errors_df.columns]
+        # Find which error columns exist
+        error_cols = [c for c in ["error_email", "error_phone", "error_required"] if c in errors_df.columns]
+        # For each row, list which fields are missing/invalid
+        def error_fields(row):
+            fields = []
+            for c in error_cols:
+                val = str(row.get(c, ""))
+                if val and val != "nan" and val != "None":
+                    fields.append(f"{c.replace('error_','')}: {val}")
+            return "; ".join(fields)
+        report_df = errors_df[id_cols].copy()
+        report_df["missing_or_invalid_fields"] = errors_df.apply(error_fields, axis=1)
+        report_df = report_df[ id_cols + ["missing_or_invalid_fields"] ]
+        report_df.to_csv(missing_report_csv, index=False)
+        print(f"[OK] Wrote: {missing_report_csv}")
+
     print(f"[OK] Wrote: {cleaned_csv}")
     print(f"[OK] Wrote: {errors_csv}")
+
+
+def _compute_error_stats(errors_df: pd.DataFrame):
+    """Return (invalid_email_count, invalid_phone_count, missing_required_count, Counter of error types)."""
+    invalid_email = int(errors_df["error_email"].fillna("").astype(str).str.contains("invalid_email").sum())
+    invalid_phone = int(errors_df["error_phone"].fillna("").astype(str).str.contains("invalid").sum())
+    missing_required = int(errors_df["error_required"].fillna("").astype(str).str.contains("missing_").sum())
+
+    c = Counter()
+    for s in errors_df["errors_all"].fillna(""):
+        for part in [p for p in str(s).split(";") if p]:
+            c[part] += 1
+    return invalid_email, invalid_phone, missing_required, c
+
+
+def _write_summary(prefix: str, total_in: int, total_out: int, invalid_email: int, invalid_phone: int, missing_required: int, top_errors: Counter) -> None:
+    summary_txt = f"{prefix}_summary.txt"
+    lines = []
+    lines.append(f"Total rows in: {total_in}")
+    lines.append(f"Rows out after dedupe: {total_out}")
+    lines.append(f"Invalid email count: {invalid_email}")
+    lines.append(f"Invalid phone count: {invalid_phone}")
+    lines.append(f"Missing required count: {missing_required}")
+    lines.append("")
+    lines.append("Top error types:")
+    for err, cnt in top_errors.most_common(10):
+        lines.append(f"  {err}: {cnt}")
+    txt = "\n".join(lines)
+    with open(summary_txt, "w", encoding="utf-8") as f:
+        f.write(txt)
+    print(f"[OK] Wrote summary: {summary_txt}")
 
 
 def export_outputs_streaming(
@@ -721,6 +872,8 @@ def main():
             print("[INFO] Columns:", list(df_raw.columns))
             cleaned, errors = clean_contacts_df(df_raw, opts)
             export_outputs(cleaned, errors, opts.output_prefix)
+            inv_e, inv_p, miss_req, top = _compute_error_stats(errors)
+            _write_summary(opts.output_prefix, len(df_raw), len(cleaned), inv_e, inv_p, miss_req, top)
             return
 
         if opts.chunksize:
@@ -736,6 +889,8 @@ def main():
         print("[INFO] Columns:", list(df_raw.columns))
         cleaned, errors = clean_contacts_df(df_raw, opts)
         export_outputs(cleaned, errors, opts.output_prefix)
+        inv_e, inv_p, miss_req, top = _compute_error_stats(errors)
+        _write_summary(opts.output_prefix, len(df_raw), len(cleaned), inv_e, inv_p, miss_req, top)
         return
 
     if opts.write_xlsx:
@@ -751,6 +906,27 @@ def main():
     mapping_used = None
     is_first_chunk = True
 
+    # Streaming summary accumulators
+    total_in = 0
+    total_out = 0
+    invalid_email_total = 0
+    invalid_phone_total = 0
+    missing_required_total = 0
+    error_types_total: Counter = Counter()
+
+    # Count total rows (fast single pass) so we can show percentage progress. If we can't determine
+    # the count, we'll still display rows processed instead of a percent.
+    total_rows = 0
+    if mode == "csv":
+        total_rows = count_csv_rows(path)
+        if total_rows:
+            print(f"[INFO] Total rows: {total_rows}")
+
+    processed_rows = 0
+
+    # Initialize global streaming summary state so interrupts can flush partial results
+    _init_streaming_summary(opts.output_prefix)
+
     for chunk in chunks:
         if is_first_chunk and looks_like_csv_in_one_column(chunk):
             print("[WARN] Detected 'CSV in one column' format. Falling back to full-file read.")
@@ -759,6 +935,8 @@ def main():
             print("[INFO] Columns:", list(df_raw.columns))
             cleaned, errors = clean_contacts_df(df_raw, opts)
             export_outputs(cleaned, errors, opts.output_prefix)
+            inv_e, inv_p, miss_req, top = _compute_error_stats(errors)
+            _write_summary(opts.output_prefix, len(df_raw), len(cleaned), inv_e, inv_p, miss_req, top)
             return
 
         chunk = maybe_expand_csv_in_one_column(chunk)
@@ -774,6 +952,34 @@ def main():
             dedupe_state=seen_keys,
         )
         export_outputs_streaming(cleaned_chunk, errors_chunk, opts.output_prefix, is_first_chunk)
+
+        # Update streaming summary accumulators
+        total_in += len(chunk)
+        total_out += len(cleaned_chunk)
+        inv_e, inv_p, miss_req, top = _compute_error_stats(errors_chunk)
+        invalid_email_total += inv_e
+        invalid_phone_total += inv_p
+        missing_required_total += miss_req
+        error_types_total.update(top)
+
+        # Mirror updates to global streaming summary state (so we can flush on interrupt)
+        _update_streaming_summary(
+            total_in=len(chunk),
+            total_out=len(cleaned_chunk),
+            invalid_email=inv_e,
+            invalid_phone=inv_p,
+            missing_required=miss_req,
+            error_types=top,
+        )
+
+        # Update processed count and print progress
+        processed_rows += len(chunk)
+        if total_rows:
+            pct = (processed_rows / total_rows) * 100 if total_rows else 0.0
+            print(f"[PROGRESS] {processed_rows}/{total_rows} rows ({pct:.2f}%) — out={total_out} rows — invalid_email={invalid_email_total} invalid_phone={invalid_phone_total} missing_required={missing_required_total}")
+        else:
+            print(f"[PROGRESS] {processed_rows} rows processed — out={total_out} rows — invalid_email={invalid_email_total} invalid_phone={invalid_phone_total} missing_required={missing_required_total}")
+
         if is_first_chunk:
             print("[INFO] Columns:", list(chunk.columns))
         is_first_chunk = False
@@ -808,6 +1014,17 @@ def main():
     print(f"[OK] Wrote: {cleaned_csv}")
     print(f"[OK] Wrote: {errors_csv}")
 
+    # Final summary for streaming (chunked) mode
+    _flush_streaming_summary(partial=False)
+
 
 if __name__ == "__main__":
     try:
+        main()
+    except KeyboardInterrupt:
+        try:
+            _flush_streaming_summary(partial=True)
+        except Exception:
+            pass
+        print("\n[WARN] Interrupted by user (Ctrl+C). Exiting.")
+        sys.exit(130)
